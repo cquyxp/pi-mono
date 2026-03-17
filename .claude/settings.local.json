@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell -Command \"ls env: | Where-Object {$_.Name -like ''*ANTHROPIC*'' -and $_.Name -like ''*MODEL*''}\")"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
