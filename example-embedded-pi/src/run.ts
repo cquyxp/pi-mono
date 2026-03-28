@@ -3,6 +3,9 @@ import {
   SettingsManager,
   AuthStorage,
   ModelRegistry,
+  discoverContextFiles,
+  buildSystemPrompt,
+  codingTools,
 } from "@mariozechner/pi-coding-agent";
 import { getAgentDir } from "@mariozechner/pi-coding-agent";
 import { getModel } from "@mariozechner/pi-ai";
@@ -14,6 +17,7 @@ import {
   prewarmSessionFile,
   trackSessionManagerAccess,
 } from "./session-manager.js";
+import { WORKSPACE_DIR, AGENTS_DIR } from "./workspace-config.js";
 import type {
   EmbeddedPiAgentParams,
   EmbeddedPiRunResult,
@@ -84,14 +88,15 @@ export async function runEmbeddedPiAgent(params: RunEmbeddedPiAgentParams): Prom
 
   const startTime = Date.now();
   let subscription: { unsubscribe: () => void } | null = null;
+  let capturedText = "";
 
   try {
     // 1. Initialize session file
     prewarmSessionFile(sessionFile);
 
     // 2. Resolve directories
-    const resolvedAgentDir = agentDir ?? join(homedir(), ".pi", "agent");
-    const resolvedWorkspace = workspaceDir ?? process.cwd();
+    const resolvedAgentDir = agentDir ?? AGENTS_DIR;
+    const resolvedWorkspace = workspaceDir ?? WORKSPACE_DIR;
 
     // 3. Create core components
     const settingsManager = SettingsManager.create(resolvedWorkspace, resolvedAgentDir);
@@ -118,7 +123,25 @@ export async function runEmbeddedPiAgent(params: RunEmbeddedPiAgentParams): Prom
     // 6. Split tools
     const { builtInTools, customTools } = splitTools({ tools });
 
-    // 7. Create agent session
+    // 7. 发现所有 context files 并构建完整的 system prompt
+    const contextFiles = discoverContextFiles(resolvedWorkspace, resolvedAgentDir);
+
+    // 8. 构建最终的 system prompt
+    let finalSystemPrompt: string | ((defaultPrompt: string) => string);
+    if (systemPrompt) {
+      finalSystemPrompt = systemPrompt;
+    } else if (appendSystemPrompt) {
+      finalSystemPrompt = (defaultPrompt: string) => defaultPrompt + "\n\n" + appendSystemPrompt;
+    } else {
+      // 使用 buildSystemPrompt 构建包含所有 context files 的完整 system prompt
+      finalSystemPrompt = buildSystemPrompt({
+        contextFiles,
+        tools: codingTools,
+        cwd: resolvedWorkspace,
+      });
+    }
+
+    // 9. Create agent session
     const { session } = await createAgentSession({
       cwd: resolvedWorkspace,
       agentDir: resolvedAgentDir,
@@ -130,18 +153,31 @@ export async function runEmbeddedPiAgent(params: RunEmbeddedPiAgentParams): Prom
       customTools,
       sessionManager,
       settingsManager,
+      systemPrompt: finalSystemPrompt,
+      contextFiles,
     });
 
-    // 9. Apply system prompt overrides
-    if (systemPrompt || appendSystemPrompt) {
-      applySystemPromptOverride(session, systemPrompt, appendSystemPrompt);
-    }
+    // 10. Subscribe to events - wrap to capture text
+    const wrappedHandlers = {
+      ...eventHandlers,
+      onBlockReply: (payload: any) => {
+        capturedText = payload.text || "";
+        if (eventHandlers.onBlockReply) {
+          eventHandlers.onBlockReply(payload);
+        }
+      },
+      onPartialReply: (text: string) => {
+        capturedText = text;
+        if (eventHandlers.onPartialReply) {
+          eventHandlers.onPartialReply(text);
+        }
+      },
+    };
 
-    // 10. Subscribe to events
     subscription = subscribeEmbeddedPiSession({
       session,
       runId,
-      ...eventHandlers,
+      ...wrappedHandlers,
     });
 
     // 11. Run the prompt with timeout
@@ -156,8 +192,7 @@ export async function runEmbeddedPiAgent(params: RunEmbeddedPiAgentParams): Prom
     await Promise.race([promptPromise, timeoutPromise]);
 
     // 12. Build result
-    const lastMessage = session.getMessages().pop();
-    const text = lastMessage && "content" in lastMessage ? String(lastMessage.content) : "";
+    const text = capturedText || "";
 
     return {
       success: true,

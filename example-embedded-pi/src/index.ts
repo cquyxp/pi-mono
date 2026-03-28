@@ -36,3 +36,15 @@ export {
 
 // Re-export evolution system
 export * from "./evolution/index.js";
+
+// Re-export web tools
+export * from "./web-tools.js";
+
+// Re-export autoresearch tools
+export * from "./autoresearch-tools.js";
+
+// Re-export workspace config
+export * from "./workspace-config.js";
+
+// Re-export session utilities
+export * from "./session-utils.js";

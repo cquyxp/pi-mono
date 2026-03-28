@@ -1,6 +1,6 @@
 import { SessionManager } from "@mariozechner/pi-coding-agent";
-import { existsSync, mkdirSync } from "fs";
-import { dirname } from "path";
+import fs from "fs";
+import path from "path";
 import type { SessionManagerCache } from "./types.js";
 
 // Cache SessionManager instances to avoid reopening the same file
@@ -11,9 +11,9 @@ const SESSION_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
  * Ensure the session file directory exists
  */
 export function ensureSessionDir(sessionFile: string): void {
-  const dir = dirname(sessionFile);
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
+  const dir = path.dirname(sessionFile);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
   }
 }
 
@@ -23,10 +23,10 @@ export function ensureSessionDir(sessionFile: string): void {
 export function prewarmSessionFile(sessionFile: string): void {
   ensureSessionDir(sessionFile);
 
-  if (!existsSync(sessionFile)) {
-    // Create an empty session file
-    const manager = SessionManager.open(sessionFile);
-    manager.close();
+  if (!fs.existsSync(sessionFile)) {
+    // Create an empty session file by opening it
+    SessionManager.open(sessionFile);
+    // Don't call close() - SessionManager may not have this method
   }
 }
 
@@ -39,11 +39,7 @@ export function getCachedSessionManager(sessionFile: string): SessionManager {
   // Clean up expired entries
   for (const [file, cache] of Object.entries(sessionCache)) {
     if (now - cache.lastAccess > SESSION_CACHE_TTL) {
-      try {
-        cache.manager?.close?.();
-      } catch {
-        // Ignore close errors
-      }
+      // Don't call close() - just remove from cache
       delete sessionCache[file];
     }
   }
@@ -75,12 +71,6 @@ export function trackSessionManagerAccess(sessionFile: string): void {
  * Close all cached session managers
  */
 export function closeAllSessionManagers(): void {
-  for (const cache of Object.values(sessionCache)) {
-    try {
-      cache.manager?.close?.();
-    } catch {
-      // Ignore close errors
-    }
-  }
+  // Just clear the cache - don't call close()
   Object.keys(sessionCache).forEach((key) => delete sessionCache[key]);
 }

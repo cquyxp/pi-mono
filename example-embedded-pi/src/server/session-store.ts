@@ -14,6 +14,7 @@ export interface ActiveSession {
   }>;
   abortController?: AbortController;
   isRunning: boolean;
+  systemPrompt?: string;
 }
 
 export class SessionStore {
@@ -62,6 +63,14 @@ export class SessionStore {
         timestamp: Date.now(),
       });
     }
+  }
+
+  getHistory(sessionId: string): Array<{ role: string; content: string }> {
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      return session.history.map(h => ({ role: h.role, content: h.content }));
+    }
+    return [];
   }
 
   broadcast(

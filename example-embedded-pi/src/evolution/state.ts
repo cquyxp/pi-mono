@@ -1,12 +1,12 @@
 /**
  * State management for the evolutionary system
  */
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
-import { dirname, join } from "path";
+import fs from "fs";
+import path from "path";
 import { homedir } from "os";
 import type { EvolutionState, EvolutionConfig, ImprovementResult } from "./types.js";
 
-const DEFAULT_STATE_FILE = join(homedir(), ".example-embedded-pi", "evolution-state.json");
+const DEFAULT_STATE_FILE = path.join(homedir(), ".example-embedded-pi", "evolution-state.json");
 
 const DEFAULT_CONFIG: EvolutionConfig = {
   dailyStartTime: "02:00",
@@ -39,16 +39,17 @@ export function getState(): EvolutionState {
   if (!currentState) {
     loadState();
   }
-  return currentState!;
+  return currentState as EvolutionState;
 }
 
 export function loadState(): EvolutionState {
   const stateFile = currentConfig.stateFile;
 
-  if (existsSync(stateFile)) {
+  if (fs.existsSync(stateFile)) {
     try {
-      const content = readFileSync(stateFile, "utf-8");
-      currentState = JSON.parse(content);
+      const content = fs.readFileSync(stateFile, "utf-8");
+      const parsed = JSON.parse(content);
+      currentState = parsed || createEmptyState();
     } catch {
       currentState = createEmptyState();
     }
@@ -56,18 +57,18 @@ export function loadState(): EvolutionState {
     currentState = createEmptyState();
   }
 
-  return currentState;
+  return currentState as EvolutionState;
 }
 
 export function saveState(): void {
   const stateFile = currentConfig.stateFile;
-  const dir = dirname(stateFile);
+  const dir = path.dirname(stateFile);
 
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
   }
 
-  writeFileSync(stateFile, JSON.stringify(currentState, null, 2));
+  fs.writeFileSync(stateFile, JSON.stringify(currentState, null, 2));
 }
 
 export function recordImprovement(result: ImprovementResult): void {

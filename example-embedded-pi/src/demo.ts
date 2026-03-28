@@ -8,9 +8,8 @@
  */
 
 import { join } from "path";
-import { homedir } from "os";
 import { existsSync, mkdirSync } from "fs";
-import { runEmbeddedPiAgent, createExampleTools } from "./index.js";
+import { runEmbeddedPiAgent, createExampleTools, SESSION_DIR } from "./index.js";
 
 async function main() {
   console.log("=".repeat(60));
@@ -19,9 +18,8 @@ async function main() {
   console.log();
 
   // Create session directory
-  const sessionDir = join(homedir(), ".example-embedded-pi", "sessions");
-  if (!existsSync(sessionDir)) {
-    mkdirSync(sessionDir, { recursive: true });
+  if (!existsSync(SESSION_DIR)) {
+    mkdirSync(SESSION_DIR, { recursive: true });
   }
 
   // Create example tools
@@ -38,8 +36,7 @@ async function main() {
   const result = await runEmbeddedPiAgent({
     sessionId: "demo-session-001",
     sessionKey: "demo:user:001",
-    sessionFile: join(sessionDir, "demo.jsonl"),
-    workspaceDir: process.cwd(),
+    sessionFile: join(SESSION_DIR, "demo.jsonl"),
     prompt: "What's 15 + 27 * 2? Also, what's the weather in Tokyo?",
     provider: "volcengine-coding",
     model: "doubao-seed-2.0-code",
