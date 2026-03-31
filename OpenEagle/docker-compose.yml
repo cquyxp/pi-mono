@@ -1,0 +1,74 @@
+version: '3.8'
+
+# ========================================================
+# Example Embedded Pi - Docker Compose 配置
+# ========================================================
+# 使用方法：
+#   1. 复制 .env.example 为 .env，填入你的 API Keys
+#   2. 运行: docker compose up -d
+#   3. 访问: http://localhost:7187
+# ========================================================
+
+services:
+  pi-agent:
+    # 容器名称
+    container_name: pi-agent
+
+    # 从当前目录的 Dockerfile 构建
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    # 自动重启策略：除非手动停止，否则总是重启
+    restart: unless-stopped
+
+    # 端口映射：宿主机端口:容器端口
+    ports:
+      - "7187:7187"
+
+    # 环境变量
+    environment:
+      # 基本配置
+      - NODE_ENV=production
+      - PORT=7187
+
+      # 目录配置（容器内路径）
+      - WORKSPACE_DIR=/app/workspace
+      - SETTINGS_DIR=/app/workspace/settings
+
+      # API Keys（从 .env 文件读取，留空则不设置）
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - VOLCENGINE_API_KEY=${VOLCENGINE_API_KEY:-}
+
+    # 数据卷挂载：数据持久化
+    volumes:
+      # 方式 1：使用命名卷（推荐，Docker 管理）
+      - pi-agent-data:/app/workspace
+
+      # 方式 2：绑定挂载到宿主机目录（方便直接访问文件）
+      # - ./workspace:/app/workspace
+
+    # 资源限制（可选，防止占用过多资源）
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
+    # 健康检查依赖：确保服务健康后才启动
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7187/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+# 命名卷定义：数据会持久化保存，即使删除容器也不会丢失
+volumes:
+  pi-agent-data:
+    name: pi-agent-data
