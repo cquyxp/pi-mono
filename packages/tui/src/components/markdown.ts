@@ -1,7 +1,240 @@
-import { marked, type Token } from "marked";
-import { isImageLine } from "../terminal-image.js";
-import type { Component } from "../tui.js";
-import { applyBackgroundToLine, visibleWidth, wrapTextWithAnsi } from "../utils.js";
+import { Marked, type Token, Tokenizer, type TokenizerExtension, type Tokens, type TokensList } from "marked";
+import markedCjkFriendly from "marked-cjk-friendly";
+import { renderLatex } from "../latex.ts";
+import { getCapabilities, hyperlink, isImageLine } from "../terminal-image.ts";
+import type { Component } from "../tui.ts";
+import { applyBackgroundToLine, cjkPunctuationRegex, flattenLines, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
+
+const STRICT_STRIKETHROUGH_REGEX = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
+
+class MarkdownTokenizer extends Tokenizer {
+	override url(src: string): Tokens.Link | undefined {
+		const token = super.url(src);
+		if (!token) return undefined;
+
+		// Bare URLs stop at CJK punctuation; explicit links and angle autolinks
+		// use separate tokenizers and can still contain these characters.
+		const punctuationIndex = token.raw.search(cjkPunctuationRegex);
+		return punctuationIndex < 0 ? token : super.url(token.raw.slice(0, punctuationIndex));
+	}
+
+	override del(src: string): Tokens.Del | undefined {
+		const match = STRICT_STRIKETHROUGH_REGEX.exec(src);
+		if (!match) {
+			return undefined;
+		}
+
+		const text = match[2];
+		return {
+			type: "del",
+			raw: match[0],
+			text,
+			tokens: this.lexer.inlineTokens(text),
+		};
+	}
+}
+
+interface LatexToken extends Tokens.Generic {
+	type: "latex" | "latexBlock";
+	text: string;
+	pending?: boolean;
+}
+
+function isEscaped(source: string, index: number): boolean {
+	let backslashes = 0;
+	for (let position = index - 1; position >= 0 && source[position] === "\\"; position--) {
+		backslashes++;
+	}
+	return backslashes % 2 === 1;
+}
+
+function findClosingDelimiter(source: string, closing: string, start: number): number {
+	let index = source.indexOf(closing, start);
+	while (index >= 0 && isEscaped(source, index)) {
+		index = source.indexOf(closing, index + closing.length);
+	}
+	return index;
+}
+
+function looksLikePendingDollarMath(source: string): boolean {
+	return /\\[A-Za-z]+|[_^=+*/<>()[\]|±≤≥≠≈∈→⇒∞∫∑√-]/.test(source);
+}
+
+function tokenizeInlineLatex(source: string): LatexToken | undefined {
+	let opening = "";
+	let closing = "";
+	if (source.startsWith("$$")) {
+		opening = "$$";
+		closing = "$$";
+	} else if (source.startsWith("\\(")) {
+		opening = "\\(";
+		closing = "\\)";
+	} else if (source.startsWith("\\[")) {
+		opening = "\\[";
+		closing = "\\]";
+	} else if (source.startsWith("$") && !/^\$\s/.test(source)) {
+		opening = "$";
+		closing = "$";
+	} else {
+		return undefined;
+	}
+
+	const closingIndex = findClosingDelimiter(source, closing, opening.length);
+	if (
+		closingIndex >= 0 &&
+		opening === "$" &&
+		(/\s$/.test(source.slice(opening.length, closingIndex)) ||
+			/^\d/.test(source.slice(closingIndex + 1)) ||
+			(/^[A-Z_][A-Z0-9_]*(?:[^A-Za-z0-9_\s])?$/.test(source.slice(opening.length, closingIndex)) &&
+				/^[A-Za-z_][A-Za-z0-9_]*/.test(source.slice(closingIndex + 1))) ||
+			source.slice(opening.length, closingIndex).includes("`"))
+	) {
+		return undefined;
+	}
+
+	if (closingIndex < 0) {
+		const pendingSource = source.slice(opening.length);
+		if (opening.startsWith("\\") || looksLikePendingDollarMath(pendingSource)) {
+			return { type: "latex", raw: source, text: pendingSource, pending: true };
+		}
+		return undefined;
+	}
+
+	const text = source.slice(opening.length, closingIndex);
+	if (!text || text.includes("\n")) {
+		return undefined;
+	}
+
+	const raw = source.slice(0, closingIndex + closing.length);
+	return { type: "latex", raw, text };
+}
+
+const TABLE_DELIMITER_ROW_REGEX = /^ {0,3}\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$/;
+
+// A GFM table starts with a header row followed by a delimiter row such as "|---|---|" or "| --- |".
+// The header needs a "|" only when the delimiter has none: a pipe-free delimiter without a pipe in the
+// header is a thematic break, not a table.
+function containsTableStart(source: string): boolean {
+	const lines = source.split("\n");
+	for (let index = 0; index < lines.length - 1; index++) {
+		const delimiterRow = lines[index + 1];
+		if ((delimiterRow.includes("|") || lines[index].includes("|")) && TABLE_DELIMITER_ROW_REGEX.test(delimiterRow)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function tokenizeBlockLatex(source: string): LatexToken | undefined {
+	// Display math never spans a table. Without this check, an unclosed "$$" or "\[" pairs with a later
+	// opener or stays pending, swallowing the table. See https://github.com/earendil-works/pi/issues/11159.
+	const dollarMatch = /^ {0,3}\$\$[ \t]*(?:\n)?([\s\S]*?)\$\$[ \t]*(?:\n|$)/.exec(source);
+	if (dollarMatch?.[1] && !containsTableStart(dollarMatch[1])) {
+		return { type: "latexBlock", raw: dollarMatch[0], text: dollarMatch[1].trim() };
+	}
+
+	const bracketMatch = /^ {0,3}\\\[[ \t]*(?:\n)?([\s\S]*?)\\\][ \t]*(?:\n|$)/.exec(source);
+	if (bracketMatch?.[1] && !containsTableStart(bracketMatch[1])) {
+		return { type: "latexBlock", raw: bracketMatch[0], text: bracketMatch[1].trim() };
+	}
+
+	const pendingBracket = /^ {0,3}\\\[[ \t]*(?:\n)?([\s\S]*)$/.exec(source);
+	if (pendingBracket?.[1] && !containsTableStart(pendingBracket[1])) {
+		return { type: "latexBlock", raw: pendingBracket[0], text: pendingBracket[1], pending: true };
+	}
+	const pendingDollar = /^ {0,3}\$\$[ \t]*(?:\n)?([\s\S]*)$/.exec(source);
+	if (pendingDollar?.[1] && looksLikePendingDollarMath(pendingDollar[1]) && !containsTableStart(pendingDollar[1])) {
+		return { type: "latexBlock", raw: pendingDollar[0], text: pendingDollar[1], pending: true };
+	}
+	return undefined;
+}
+
+const LATEX_MARKDOWN_EXTENSIONS: readonly TokenizerExtension[] = [
+	{
+		name: "latexBlock",
+		level: "block",
+		start(source) {
+			const match = /(?:^|\n) {0,3}(?:\$\$|\\\[)/.exec(source);
+			return match ? match.index + (match[0].startsWith("\n") ? 1 : 0) : undefined;
+		},
+		tokenizer: tokenizeBlockLatex,
+	},
+	{
+		name: "latex",
+		level: "inline",
+		start(source) {
+			const indices = [source.indexOf("$"), source.indexOf("\\("), source.indexOf("\\[")].filter(
+				(index) => index >= 0,
+			);
+			return indices.length > 0 ? Math.min(...indices) : undefined;
+		},
+		tokenizer: tokenizeInlineLatex,
+	},
+];
+
+function trimPartialClosingFences(tokens: readonly Token[]): void {
+	const token = tokens[tokens.length - 1];
+	if (token?.type === "list") {
+		trimPartialClosingFences(token.items[token.items.length - 1]?.tokens ?? []);
+		return;
+	}
+	if (token?.type === "blockquote") {
+		trimPartialClosingFences(token.tokens ?? []);
+		return;
+	}
+	if (token?.type !== "code") {
+		return;
+	}
+
+	// Trim streamed partial closing fences so code blocks do not shrink/flicker
+	// when the final fence character arrives. See https://github.com/earendil-works/pi/issues/5825.
+	const marker = /^(`{3,}|~{3,})/.exec(token.raw)?.[1];
+	const lastLine = token.raw.split("\n").pop();
+	if (!marker || !lastLine || lastLine.length >= marker.length || lastLine !== marker[0]?.repeat(lastLine.length)) {
+		return;
+	}
+
+	token.text = token.text.slice(0, -lastLine.length).replace(/\n$/, "");
+}
+
+// An unclosed comment runs to the end of an HTML block, as in CommonMark, so streamed comments stay hidden.
+const HTML_COMMENT_REGEX = /<!--[\s\S]*?(?:-->|$)/g;
+
+function stripHtmlComments(html: string): string {
+	return html.replace(HTML_COMMENT_REGEX, "");
+}
+
+/**
+ * Remove block HTML tokens that hold only comments, so they render no line. A removed comment between two blank
+ * lines, or at the start or end, also drops a blank line, so it leaves no extra gap.
+ * See https://github.com/earendil-works/pi/issues/11710.
+ */
+function removeHtmlCommentBlocks(tokens: Token[]): void {
+	for (let i = tokens.length - 1; i >= 0; i--) {
+		const token = tokens[i];
+		if (token.type === "list") {
+			for (const item of token.items) removeHtmlCommentBlocks(item.tokens);
+		} else if (token.type === "blockquote") {
+			removeHtmlCommentBlocks(token.tokens ?? []);
+		} else if (token.type === "html" && stripHtmlComments(token.raw).trim() === "") {
+			tokens.splice(i, 1);
+			if (tokens[i]?.type === "space" && (i === 0 || tokens[i - 1]?.type === "space")) {
+				tokens.splice(i, 1);
+			} else if (i === tokens.length && tokens[i - 1]?.type === "space") {
+				tokens.splice(--i, 1);
+			}
+		}
+	}
+}
+
+const markdownParser = new Marked();
+markdownParser.setOptions({
+	tokenizer: new MarkdownTokenizer(),
+});
+markdownParser.use({
+	tokenizer: { emStrong: markedCjkFriendly().tokenizer?.emStrong },
+	extensions: [...LATEX_MARKDOWN_EXTENSIONS],
+});
 
 /**
  * Default text styling for markdown content.
@@ -41,14 +274,36 @@ export interface MarkdownTheme {
 	italic: (text: string) => string;
 	strikethrough: (text: string) => string;
 	underline: (text: string) => string;
+	/** Highlighted lines of a code block. A Markdown component reuses the result for the same code until invalidate(). */
 	highlightCode?: (code: string, lang?: string) => string[];
 	/** Prefix applied to each rendered code block line (default: "  ") */
 	codeBlockIndent?: string;
 }
 
+export interface MarkdownOptions {
+	/** Preserve source list markers instead of normalizing them. */
+	preserveOrderedListMarkers?: boolean;
+	/** Preserve source backslash escapes instead of normalizing escaped punctuation. */
+	preserveBackslashEscapes?: boolean;
+	/** Transform source Markdown before parsing, with the exact width available for content. */
+	transform?: (markdown: string, availableWidth: number) => string;
+	/** Render supported LaTeX math expressions as Unicode text (default: true). */
+	renderLatex?: boolean;
+}
+
 interface InlineStyleContext {
 	applyText: (text: string) => string;
 	stylePrefix: string;
+}
+
+/** A top-level block of the last render, keyed by its source, reused by the next render. */
+interface RenderedBlock {
+	/** Width and type of the following block (which decides the spacing) that the lines were rendered for. */
+	width: number;
+	nextTokenType: string | undefined;
+	lines: string[];
+	/** Highlighted lines of the block's code, keyed by language and source; they survive a resize or new spacing. */
+	highlightedCode: Map<string, string[]>;
 }
 
 export class Markdown implements Component {
@@ -57,12 +312,24 @@ export class Markdown implements Component {
 	private paddingY: number; // Top/bottom padding
 	private defaultTextStyle?: DefaultTextStyle;
 	private theme: MarkdownTheme;
+	private options: MarkdownOptions;
 	private defaultStylePrefix?: string;
 
 	// Cache for rendered output
 	private cachedText?: string;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
+	// Parsed tokens depend only on the source, so they survive theme and width invalidation. Held weakly: a token tree is
+	// about ten times the size of its source, and every message of a long transcript keeps a Markdown component. The
+	// tokens survive a burst of re-renders, such as a theme preview, and are collected afterwards.
+	private cachedTokens?: WeakRef<{ source: string; tokens: TokensList }>;
+	// The last render's top-level blocks. While a message streams only its last block changes, so a render styles and
+	// wraps only that block. Each render keeps only the blocks it used, which drops a streamed block's earlier versions.
+	// Held weakly like the tokens: the blocks repeat the source in their keys and the code in their highlighting, and
+	// only a burst of renders, such as streaming or a resize, needs them.
+	private blocks?: WeakRef<Map<string, RenderedBlock>>;
+	// Highlighted code of the block being rendered, only set while renderBlock runs.
+	private blockHighlightedCode?: Map<string, string[]>;
 
 	constructor(
 		text: string,
@@ -70,26 +337,35 @@ export class Markdown implements Component {
 		paddingY: number,
 		theme: MarkdownTheme,
 		defaultTextStyle?: DefaultTextStyle,
+		options?: MarkdownOptions,
 	) {
 		this.text = text;
 		this.paddingX = paddingX;
 		this.paddingY = paddingY;
 		this.theme = theme;
 		this.defaultTextStyle = defaultTextStyle;
+		this.options = options ? { ...options } : {};
 	}
 
 	setText(text: string): void {
 		this.text = text;
-		this.invalidate();
+		this.clearRenderCache();
 	}
 
 	invalidate(): void {
+		this.clearRenderCache();
+		// The theme may have changed, which changes every styled line and the default style's prefix.
+		this.blocks = undefined;
+		this.defaultStylePrefix = undefined;
+	}
+
+	private clearRenderCache(): void {
 		this.cachedText = undefined;
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
 	}
 
-	render(width: number): string[] {
+	render(width: number): readonly string[] {
 		// Check cache
 		if (this.cachedLines && this.cachedText === this.text && this.cachedWidth === width) {
 			return this.cachedLines;
@@ -97,9 +373,11 @@ export class Markdown implements Component {
 
 		// Calculate available width for content (subtract horizontal padding)
 		const contentWidth = Math.max(1, width - this.paddingX * 2);
+		const text = this.options.transform?.(this.text, contentWidth) ?? this.text;
 
 		// Don't render anything if there's no actual text
-		if (!this.text || this.text.trim() === "") {
+		if (!text || text.trim() === "") {
+			this.blocks = undefined;
 			const result: string[] = [];
 			// Update cache
 			this.cachedText = this.text;
@@ -109,65 +387,51 @@ export class Markdown implements Component {
 		}
 
 		// Replace tabs with 3 spaces for consistent rendering
-		const normalizedText = this.text.replace(/\t/g, "   ");
+		const normalizedText = text.replace(/\t/g, "   ");
 
 		// Parse markdown to HTML-like tokens
-		const tokens = marked.lexer(normalizedText);
+		const cached = this.cachedTokens?.deref();
+		let tokens = cached?.source === normalizedText ? cached.tokens : undefined;
+		if (!tokens) {
+			tokens = markdownParser.lexer(normalizedText);
+			trimPartialClosingFences(tokens);
+			removeHtmlCommentBlocks(tokens);
+			this.cachedTokens = new WeakRef({ source: normalizedText, tokens });
+		}
 
-		// Convert tokens to styled terminal output
-		const renderedLines: string[] = [];
-
+		// A reference link resolves through a definition anywhere in the text, so blocks with the same source can render
+		// differently; such texts are rare in practice and render without reusing blocks.
+		const reuseBlocks = Object.keys(tokens.links).length === 0;
+		const previousBlocks = this.blocks?.deref();
+		const blocks = new Map<string, RenderedBlock>();
+		this.blocks = new WeakRef(blocks);
+		const contentLines: string[] = [];
 		for (let i = 0; i < tokens.length; i++) {
 			const token = tokens[i];
-			const nextToken = tokens[i + 1];
-			const tokenLines = this.renderToken(token, contentWidth, nextToken?.type);
-			renderedLines.push(...tokenLines);
-		}
-
-		// Wrap lines (NO padding, NO background yet)
-		const wrappedLines: string[] = [];
-		for (const line of renderedLines) {
-			if (isImageLine(line)) {
-				wrappedLines.push(line);
-			} else {
-				wrappedLines.push(...wrapTextWithAnsi(line, contentWidth));
+			const nextTokenType = tokens[i + 1]?.type;
+			const reused = reuseBlocks ? (blocks.get(token.raw) ?? previousBlocks?.get(token.raw)) : undefined;
+			const block = reused ?? { width: -1, nextTokenType, lines: [], highlightedCode: new Map() };
+			if (block.width !== width || block.nextTokenType !== nextTokenType) {
+				this.renderBlock(block, token, nextTokenType, width, contentWidth);
 			}
-		}
-
-		// Add margins and background to each wrapped line
-		const leftMargin = " ".repeat(this.paddingX);
-		const rightMargin = " ".repeat(this.paddingX);
-		const bgFn = this.defaultTextStyle?.bgColor;
-		const contentLines: string[] = [];
-
-		for (const line of wrappedLines) {
-			if (isImageLine(line)) {
+			if (reuseBlocks) blocks.set(token.raw, block);
+			for (const line of block.lines) {
 				contentLines.push(line);
-				continue;
-			}
-
-			const lineWithMargins = leftMargin + line + rightMargin;
-
-			if (bgFn) {
-				contentLines.push(applyBackgroundToLine(lineWithMargins, width, bgFn));
-			} else {
-				// No background - just pad to width
-				const visibleLen = visibleWidth(lineWithMargins);
-				const paddingNeeded = Math.max(0, width - visibleLen);
-				contentLines.push(lineWithMargins + " ".repeat(paddingNeeded));
 			}
 		}
 
 		// Add top/bottom padding (empty lines)
+		const bgFn = this.defaultTextStyle?.bgColor;
 		const emptyLine = " ".repeat(width);
 		const emptyLines: string[] = [];
 		for (let i = 0; i < this.paddingY; i++) {
 			const line = bgFn ? applyBackgroundToLine(emptyLine, width, bgFn) : emptyLine;
 			emptyLines.push(line);
 		}
+		flattenLines(emptyLines);
 
 		// Combine top padding, content, and bottom padding
-		const result = [...emptyLines, ...contentLines, ...emptyLines];
+		const result = emptyLines.concat(contentLines, emptyLines);
 
 		// Update cache
 		this.cachedText = this.text;
@@ -175,6 +439,46 @@ export class Markdown implements Component {
 		this.cachedLines = result;
 
 		return result.length > 0 ? result : [""];
+	}
+
+	/** Render one top-level block to output lines: wrapped, with margins, and padded or backgrounded to the width. */
+	private renderBlock(
+		block: RenderedBlock,
+		token: Token,
+		nextTokenType: string | undefined,
+		width: number,
+		contentWidth: number,
+	): void {
+		this.blockHighlightedCode = block.highlightedCode;
+		const leftMargin = " ".repeat(this.paddingX);
+		const rightMargin = " ".repeat(this.paddingX);
+		const bgFn = this.defaultTextStyle?.bgColor;
+		const lines: string[] = [];
+		// Image lines skip wrapping, so split them here: hard breaks after an image must stay separate rows.
+		const tokenLines = this.renderToken(token, contentWidth, nextTokenType).flatMap((line) =>
+			isImageLine(line) ? line.split("\n") : [line],
+		);
+		for (const line of tokenLines) {
+			if (isImageLine(line)) {
+				lines.push(line);
+				continue;
+			}
+			for (const wrappedLine of wrapTextWithAnsi(line, contentWidth)) {
+				const lineWithMargins = leftMargin + wrappedLine + rightMargin;
+				if (bgFn) {
+					lines.push(applyBackgroundToLine(lineWithMargins, width, bgFn));
+				} else {
+					// No background - just pad to width
+					const paddingNeeded = Math.max(0, width - visibleWidth(lineWithMargins));
+					lines.push(lineWithMargins + " ".repeat(paddingNeeded));
+				}
+			}
+		}
+		this.blockHighlightedCode = undefined;
+		flattenLines(lines);
+		block.lines = lines;
+		block.width = width;
+		block.nextTokenType = nextTokenType;
 	}
 
 	/**
@@ -272,15 +576,24 @@ export class Markdown implements Component {
 			case "heading": {
 				const headingLevel = token.depth;
 				const headingPrefix = `${"#".repeat(headingLevel)} `;
-				const headingText = this.renderInlineTokens(token.tokens || [], styleContext);
-				let styledHeading: string;
+
+				// Build a heading-specific style context so inline tokens (codespan, bold, etc.)
+				// restore heading styling after their own ANSI resets instead of falling back to
+				// the default text style.
+				let headingStyleFn: (text: string) => string;
 				if (headingLevel === 1) {
-					styledHeading = this.theme.heading(this.theme.bold(this.theme.underline(headingText)));
-				} else if (headingLevel === 2) {
-					styledHeading = this.theme.heading(this.theme.bold(headingText));
+					headingStyleFn = (text: string) => this.theme.heading(this.theme.bold(this.theme.underline(text)));
 				} else {
-					styledHeading = this.theme.heading(this.theme.bold(headingPrefix + headingText));
+					headingStyleFn = (text: string) => this.theme.heading(this.theme.bold(text));
 				}
+
+				const headingStyleContext: InlineStyleContext = {
+					applyText: headingStyleFn,
+					stylePrefix: this.getStylePrefix(headingStyleFn),
+				};
+
+				const headingText = this.renderInlineTokens(token.tokens || [], headingStyleContext);
+				const styledHeading = headingLevel >= 3 ? headingStyleFn(headingPrefix) + headingText : headingText;
 				lines.push(styledHeading);
 				if (nextTokenType && nextTokenType !== "space") {
 					lines.push(""); // Add spacing after headings (unless space token follows)
@@ -298,12 +611,40 @@ export class Markdown implements Component {
 				break;
 			}
 
+			case "text":
+				lines.push(this.renderInlineTokens([token], styleContext));
+				break;
+
+			case "latexBlock": {
+				const latexToken = token as LatexToken;
+				let rendered =
+					!latexToken.pending && this.options.renderLatex !== false
+						? renderLatex(latexToken.text, { display: true })
+						: undefined;
+				// A 2D layout cannot be wrapped row by row; fall back to the raw source when it does not fit.
+				if (rendered === undefined || rendered.split("\n").some((line) => visibleWidth(line) > width)) {
+					rendered = latexToken.raw.trim();
+				}
+				for (const line of rendered.split("\n")) {
+					lines.push(this.applyDefaultStyle(line));
+				}
+				if (nextTokenType && nextTokenType !== "space") {
+					lines.push("");
+				}
+				break;
+			}
+
 			case "code": {
 				const indent = this.theme.codeBlockIndent ?? "  ";
 				lines.push(this.theme.codeBlockBorder(`\`\`\`${token.lang || ""}`));
 				if (this.theme.highlightCode) {
-					const highlightedLines = this.theme.highlightCode(token.text, token.lang);
-					for (const hlLine of highlightedLines) {
+					const key = `${token.lang ?? ""}\0${token.text}`;
+					let highlighted = this.blockHighlightedCode?.get(key);
+					if (!highlighted) {
+						highlighted = this.theme.highlightCode(token.text, token.lang);
+						this.blockHighlightedCode?.set(key, highlighted);
+					}
+					for (const hlLine of highlighted) {
 						lines.push(`${indent}${hlLine}`);
 					}
 				} else {
@@ -321,7 +662,7 @@ export class Markdown implements Component {
 			}
 
 			case "list": {
-				const listLines = this.renderList(token as any, 0, styleContext);
+				const listLines = this.renderList(token as Tokens.List, 0, width, styleContext);
 				lines.push(...listLines);
 				// Don't add spacing after lists if a space token follows
 				// (the space token will handle it)
@@ -329,7 +670,7 @@ export class Markdown implements Component {
 			}
 
 			case "table": {
-				const tableLines = this.renderTable(token as any, width, nextTokenType, styleContext);
+				const tableLines = this.renderTable(token as Tokens.Table, width, nextTokenType, styleContext);
 				lines.push(...tableLines);
 				break;
 			}
@@ -345,24 +686,42 @@ export class Markdown implements Component {
 					return quoteStyle(lineWithReappliedStyle);
 				};
 
+				// With no room for another border ("│ " plus at least one content column), render the
+				// nested content without one. Otherwise each extra level re-wraps every child line at
+				// width 1 and the output grows exponentially with nesting depth.
+				if (width < 3) {
+					const quoteTokens = token.tokens || [];
+					for (let i = 0; i < quoteTokens.length; i++) {
+						for (const line of this.renderToken(quoteTokens[i], width, quoteTokens[i + 1]?.type, styleContext)) {
+							lines.push(line);
+						}
+					}
+					break;
+				}
+
 				// Calculate available width for quote content (subtract border "│ " = 2 chars)
-				const quoteContentWidth = Math.max(1, width - 2);
+				const quoteContentWidth = width - 2;
 
 				// Blockquotes contain block-level tokens (paragraph, list, code, etc.), so render
 				// children with renderToken() instead of renderInlineTokens().
 				// Default message style should not apply inside blockquotes.
 				const quoteInlineStyleContext: InlineStyleContext = {
 					applyText: (text: string) => text,
-					stylePrefix: "",
+					stylePrefix: quoteStylePrefix,
 				};
 				const quoteTokens = token.tokens || [];
 				const renderedQuoteLines: string[] = [];
 				for (let i = 0; i < quoteTokens.length; i++) {
 					const quoteToken = quoteTokens[i];
 					const nextQuoteToken = quoteTokens[i + 1];
-					renderedQuoteLines.push(
-						...this.renderToken(quoteToken, quoteContentWidth, nextQuoteToken?.type, quoteInlineStyleContext),
-					);
+					for (const line of this.renderToken(
+						quoteToken,
+						quoteContentWidth,
+						nextQuoteToken?.type,
+						quoteInlineStyleContext,
+					)) {
+						renderedQuoteLines.push(line);
+					}
 				}
 
 				// Avoid rendering an extra empty quote line before the outer blockquote spacing.
@@ -391,9 +750,9 @@ export class Markdown implements Component {
 				break;
 
 			case "html":
-				// Render HTML as plain text (escaped for terminal)
+				// Render HTML as plain text (escaped for terminal), without its comments
 				if ("raw" in token && typeof token.raw === "string") {
-					lines.push(this.applyDefaultStyle(token.raw.trim()));
+					lines.push(this.applyDefaultStyle(stripHtmlComments(token.raw).trim()));
 				}
 				break;
 
@@ -421,8 +780,30 @@ export class Markdown implements Component {
 			return segments.map((segment: string) => applyText(segment)).join("\n");
 		};
 
-		for (const token of tokens) {
+		// After a skipped HTML comment, drop the next text's leading space if the text before ended with one,
+		// so "a <!-- c --> b" renders as "a b".
+		let dropLeadingSpace = false;
+		for (let i = 0; i < tokens.length; i++) {
+			let token = tokens[i];
+			if (dropLeadingSpace && token.type === "text" && !token.tokens?.length && /^[ \t]/.test(token.text)) {
+				token = { ...token, text: token.text.replace(/^[ \t]+/, "") };
+			}
+			dropLeadingSpace = false;
 			switch (token.type) {
+				case "latex": {
+					const latexToken = token as LatexToken;
+					const rendered =
+						!latexToken.pending && this.options.renderLatex !== false
+							? (renderLatex(latexToken.text) ?? latexToken.raw)
+							: latexToken.raw;
+					result += applyTextWithNewlines(rendered);
+					break;
+				}
+
+				case "escape":
+					result += applyTextWithNewlines(this.options.preserveBackslashEscapes ? token.raw : token.text);
+					break;
+
 				case "text":
 					// Text tokens in list items can have nested tokens for inline formatting
 					if (token.tokens && token.tokens.length > 0) {
@@ -455,18 +836,22 @@ export class Markdown implements Component {
 
 				case "link": {
 					const linkText = this.renderInlineTokens(token.tokens || [], resolvedStyleContext);
-					// If link text matches href, only show the link once
-					// Compare raw text (token.text) not styled text (linkText) since linkText has ANSI codes
-					// For mailto: links, strip the prefix before comparing (autolinked emails have
-					// text="foo@bar.com" but href="mailto:foo@bar.com")
-					const hrefForComparison = token.href.startsWith("mailto:") ? token.href.slice(7) : token.href;
-					if (token.text === token.href || token.text === hrefForComparison) {
-						result += this.theme.link(this.theme.underline(linkText)) + stylePrefix;
+					const styledLink = this.theme.link(this.theme.underline(linkText));
+					if (getCapabilities().hyperlinks) {
+						// OSC 8: render as a clickable hyperlink. The URL is not printed inline,
+						// so we always show only the link text regardless of whether it matches href.
+						result += hyperlink(styledLink, token.href) + stylePrefix;
 					} else {
-						result +=
-							this.theme.link(this.theme.underline(linkText)) +
-							this.theme.linkUrl(` (${token.href})`) +
-							stylePrefix;
+						// Fallback: print URL in parentheses when text differs from href.
+						// Compare raw token.text (not styled) against href for the equality check.
+						// For mailto: links strip the prefix (autolinked emails use text="foo@bar.com"
+						// but href="mailto:foo@bar.com").
+						const hrefForComparison = token.href.startsWith("mailto:") ? token.href.slice(7) : token.href;
+						if (token.text === token.href || token.text === hrefForComparison) {
+							result += styledLink + stylePrefix;
+						} else {
+							result += styledLink + this.theme.linkUrl(` (${token.href})`) + stylePrefix;
+						}
 					}
 					break;
 				}
@@ -482,8 +867,10 @@ export class Markdown implements Component {
 				}
 
 				case "html":
-					// Render inline HTML as plain text
-					if ("raw" in token && typeof token.raw === "string") {
+					// Render inline HTML as plain text; comments are hidden
+					if (token.raw.startsWith("<!--")) {
+						dropLeadingSpace = i === 0 || /[ \t]$/.test(tokens[i - 1].raw);
+					} else {
 						result += applyTextWithNewlines(token.raw);
 					}
 					break;
@@ -496,110 +883,72 @@ export class Markdown implements Component {
 			}
 		}
 
+		while (stylePrefix && result.endsWith(stylePrefix)) {
+			result = result.slice(0, -stylePrefix.length);
+		}
+
 		return result;
+	}
+
+	private getOrderedListMarker(item: Tokens.ListItem): string | undefined {
+		const match = /^(?: {0,3})(\d{1,9}[.)])[ \t]+/.exec(item.raw);
+		return match ? `${match[1]} ` : undefined;
+	}
+
+	private getUnorderedListMarker(item: Tokens.ListItem): string | undefined {
+		const match = /^(?: {0,3})([-+*])(?:[ \t]+|(?=\r?\n|$))/.exec(item.raw);
+		return match ? `${match[1]} ` : undefined;
 	}
 
 	/**
 	 * Render a list with proper nesting support
 	 */
-	private renderList(
-		token: Token & { items: any[]; ordered: boolean; start?: number },
-		depth: number,
-		styleContext?: InlineStyleContext,
-	): string[] {
+	private renderList(token: Tokens.List, depth: number, width: number, styleContext?: InlineStyleContext): string[] {
 		const lines: string[] = [];
-		const indent = "  ".repeat(depth);
+		const indent = "    ".repeat(depth);
 		// Use the list's start property (defaults to 1 for ordered lists)
-		const startNumber = token.start ?? 1;
+		const startNumber = typeof token.start === "number" ? token.start : 1;
 
 		for (let i = 0; i < token.items.length; i++) {
 			const item = token.items[i];
-			const bullet = token.ordered ? `${startNumber + i}. ` : "- ";
+			const isLastItem = i === token.items.length - 1;
+			const bullet = token.ordered
+				? this.options.preserveOrderedListMarkers
+					? (this.getOrderedListMarker(item) ?? `${startNumber + i}. `)
+					: `${startNumber + i}. `
+				: this.options.preserveOrderedListMarkers
+					? (this.getUnorderedListMarker(item) ?? "- ")
+					: "- ";
+			const taskMarker = item.task ? `[${item.checked ? "x" : " "}] ` : "";
+			const marker = bullet + taskMarker;
+			const firstPrefix = indent + this.theme.listBullet(marker);
+			const continuationPrefix = indent + " ".repeat(visibleWidth(marker));
+			const itemWidth = Math.max(1, width - visibleWidth(firstPrefix));
+			let renderedAnyLine = false;
 
-			// Process item tokens to handle nested lists
-			const itemLines = this.renderListItem(item.tokens || [], depth, styleContext);
-
-			if (itemLines.length > 0) {
-				// First line - check if it's a nested list
-				// A nested list will start with indent (spaces) followed by cyan bullet
-				const firstLine = itemLines[0];
-				const isNestedList = /^\s+\x1b\[36m[-\d]/.test(firstLine); // starts with spaces + cyan + bullet char
-
-				if (isNestedList) {
-					// This is a nested list, just add it as-is (already has full indent)
-					lines.push(firstLine);
-				} else {
-					// Regular text content - add indent and bullet
-					lines.push(indent + this.theme.listBullet(bullet) + firstLine);
+			for (const itemToken of item.tokens) {
+				if (itemToken.type === "list") {
+					lines.push(...this.renderList(itemToken as Tokens.List, depth + 1, width, styleContext));
+					renderedAnyLine = true;
+					continue;
 				}
 
-				// Rest of the lines
-				for (let j = 1; j < itemLines.length; j++) {
-					const line = itemLines[j];
-					const isNestedListLine = /^\s+\x1b\[36m[-\d]/.test(line); // starts with spaces + cyan + bullet char
-
-					if (isNestedListLine) {
-						// Nested list line - already has full indent
-						lines.push(line);
-					} else {
-						// Regular content - add parent indent + 2 spaces for continuation
-						lines.push(`${indent}  ${line}`);
+				const itemLines = this.renderToken(itemToken, itemWidth, undefined, styleContext);
+				for (const line of itemLines) {
+					for (const wrappedLine of wrapTextWithAnsi(line, itemWidth)) {
+						const linePrefix = renderedAnyLine ? continuationPrefix : firstPrefix;
+						lines.push(linePrefix + wrappedLine);
+						renderedAnyLine = true;
 					}
 				}
-			} else {
-				lines.push(indent + this.theme.listBullet(bullet));
 			}
-		}
 
-		return lines;
-	}
+			if (!renderedAnyLine) {
+				lines.push(firstPrefix);
+			}
 
-	/**
-	 * Render list item tokens, handling nested lists
-	 * Returns lines WITHOUT the parent indent (renderList will add it)
-	 */
-	private renderListItem(tokens: Token[], parentDepth: number, styleContext?: InlineStyleContext): string[] {
-		const lines: string[] = [];
-
-		for (const token of tokens) {
-			if (token.type === "list") {
-				// Nested list - render with one additional indent level
-				// These lines will have their own indent, so we just add them as-is
-				const nestedLines = this.renderList(token as any, parentDepth + 1, styleContext);
-				lines.push(...nestedLines);
-			} else if (token.type === "text") {
-				// Text content (may have inline tokens)
-				const text =
-					token.tokens && token.tokens.length > 0
-						? this.renderInlineTokens(token.tokens, styleContext)
-						: token.text || "";
-				lines.push(text);
-			} else if (token.type === "paragraph") {
-				// Paragraph in list item
-				const text = this.renderInlineTokens(token.tokens || [], styleContext);
-				lines.push(text);
-			} else if (token.type === "code") {
-				// Code block in list item
-				const indent = this.theme.codeBlockIndent ?? "  ";
-				lines.push(this.theme.codeBlockBorder(`\`\`\`${token.lang || ""}`));
-				if (this.theme.highlightCode) {
-					const highlightedLines = this.theme.highlightCode(token.text, token.lang);
-					for (const hlLine of highlightedLines) {
-						lines.push(`${indent}${hlLine}`);
-					}
-				} else {
-					const codeLines = token.text.split("\n");
-					for (const codeLine of codeLines) {
-						lines.push(`${indent}${this.theme.codeBlock(codeLine)}`);
-					}
-				}
-				lines.push(this.theme.codeBlockBorder("```"));
-			} else {
-				// Other token types - try to render as inline
-				const text = this.renderInlineTokens([token], styleContext);
-				if (text) {
-					lines.push(text);
-				}
+			if (token.loose && !isLastItem) {
+				lines.push("");
 			}
 		}
 
@@ -627,8 +976,13 @@ export class Markdown implements Component {
 	 * Delegates to wrapTextWithAnsi() so ANSI codes + long tokens are handled
 	 * consistently with the rest of the renderer.
 	 */
-	private wrapCellText(text: string, maxWidth: number): string[] {
-		return wrapTextWithAnsi(text, Math.max(1, maxWidth));
+	private wrapCellText(text: string, maxWidth: number, stylePrefix = ""): string[] {
+		const lines = wrapTextWithAnsi(text, Math.max(1, maxWidth));
+		return lines.map((line, index) => {
+			// Reset text styles after each non-final fragment, then restore the surrounding style before padding and borders.
+			const styleReset = index < lines.length - 1 ? "\x1b[22;23;24;25;27;28;29;39m" : "";
+			return `${line}${styleReset}${stylePrefix}`;
+		});
 	}
 
 	/**
@@ -636,7 +990,7 @@ export class Markdown implements Component {
 	 * Cells that don't fit are wrapped to multiple lines.
 	 */
 	private renderTable(
-		token: Token & { header: any[]; rows: any[][]; raw?: string },
+		token: Tokens.Table,
 		availableWidth: number,
 		nextTokenType?: string,
 		styleContext?: InlineStyleContext,
@@ -759,7 +1113,7 @@ export class Markdown implements Component {
 		// Render header with wrapping
 		const headerCellLines: string[][] = token.header.map((cell, i) => {
 			const text = this.renderInlineTokens(cell.tokens || [], styleContext);
-			return this.wrapCellText(text, columnWidths[i]);
+			return this.wrapCellText(text, columnWidths[i], styleContext?.stylePrefix);
 		});
 		const headerLineCount = Math.max(...headerCellLines.map((c) => c.length));
 
@@ -782,7 +1136,7 @@ export class Markdown implements Component {
 			const row = token.rows[rowIndex];
 			const rowCellLines: string[][] = row.map((cell, i) => {
 				const text = this.renderInlineTokens(cell.tokens || [], styleContext);
-				return this.wrapCellText(text, columnWidths[i]);
+				return this.wrapCellText(text, columnWidths[i], styleContext?.stylePrefix);
 			});
 			const rowLineCount = Math.max(...rowCellLines.map((c) => c.length));
 

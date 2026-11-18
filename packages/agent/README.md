@@ -1,24 +1,31 @@
-# @mariozechner/pi-agent-core
+# @earendil-works/pi-agent-core
 
-Stateful agent with tool execution and event streaming. Built on `@mariozechner/pi-ai`.
+Stateful agent with tool execution and event streaming. Built on `@earendil-works/pi-ai`.
 
 ## Installation
 
 ```bash
-npm install @mariozechner/pi-agent-core
+npm install @earendil-works/pi-agent-core
 ```
 
 ## Quick Start
 
 ```typescript
-import { Agent } from "@mariozechner/pi-agent-core";
-import { getModel } from "@mariozechner/pi-ai";
+import { Agent } from "@earendil-works/pi-agent-core";
+import { createModels } from "@earendil-works/pi-ai";
+import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
+
+const models = createModels();
+models.setProvider(anthropicProvider());
+const model = models.getModel("anthropic", "claude-sonnet-4-6");
+if (!model) throw new Error("Model not found");
 
 const agent = new Agent({
   initialState: {
     systemPrompt: "You are a helpful assistant.",
-    model: getModel("anthropic", "claude-sonnet-4-20250514"),
+    model,
   },
+  streamFn: models.streamSimple.bind(models),
 });
 
 agent.subscribe((event) => {
@@ -101,30 +108,86 @@ prompt("Read config.json")
 
 Tool execution mode is configurable:
 
-- `parallel` (default): preflight tool calls sequentially, execute allowed tools concurrently, emit final `tool_execution_end` and `toolResult` messages in assistant source order
+- `parallel` (default): preflight tool calls sequentially, execute allowed tools concurrently, emit `tool_execution_end` as soon as each tool is finalized, then emit toolResult messages and `turn_end.toolResults` in assistant source order
 - `sequential`: execute tool calls one by one, matching the historical behavior
 
-The `beforeToolCall` hook runs after `tool_execution_start` and validated argument parsing. It can block execution. The `afterToolCall` hook runs after tool execution finishes and before `tool_execution_end` and final tool result message events are emitted.
+In parallel mode, tool completion events follow tool completion order, but persisted toolResult messages still follow assistant source order.
+
+The mode can be set globally via `toolExecution` in the agent config, or per-tool via `executionMode` on `AgentTool`. If any tool call in a batch targets a tool with `executionMode: "sequential"`, the entire batch executes sequentially regardless of the global setting.
+
+The `beforeToolCall` hook runs after `tool_execution_start` and validated argument parsing. It can block execution and attach `terminate: true` to the blocked result. The `afterToolCall` hook runs after tool execution finishes and before `tool_execution_end` and final tool result message events are emitted.
+
+Tools, blocked `beforeToolCall` results, and `afterToolCall` overrides can return `terminate: true` to hint that the automatic follow-up LLM call should be skipped. The loop only stops early when every finalized tool result in that batch sets `terminate: true`. Mixed batches continue normally.
 
 When you use the `Agent` class, assistant `message_end` processing is treated as a barrier before tool preflight begins. That means `beforeToolCall` sees agent state that already includes the assistant message that requested the tool call.
 
-### continue() Event Sequence
+### Request preparation and turn finalization
 
-`continue()` resumes from existing context without adding a new message. Use it for retries after errors.
+`prepareRequest` runs immediately before every conversational provider request, including the first. Use it to install canonical persisted context after pending input has been emitted:
 
 ```typescript
-// After an error, retry from current state
-await agent.continue();
+agent.prepareRequest = async ({ context }) => ({
+  context: { ...context, messages: await session.loadModelContext() },
+});
 ```
 
-The last message in context must be `user` or `toolResult` (not `assistant`).
+`prepareRequest` does not poll queues. Steering queued while it runs waits for the next normal steering poll.
+
+`finishTurn` runs after the assistant and all tool results are finalized, but before `turn_end`. It runs for normal, error, and aborted responses:
+
+```typescript
+agent.finishTurn = async ({ message }) => {
+  if (message.stopReason === "error" || message.stopReason === "aborted") return;
+  if (shouldEndRun(message)) return { action: "end" };
+  return needsAnotherResponse(message) ? { action: "continue" } : undefined;
+};
+```
+
+Returning `undefined` preserves normal scheduling. `{ action: "end" }` stops immediately after `turn_end`, before polling steering or follow-up queues or preparing another request. On a normal response, `{ action: "continue" }` ensures one next provider request. If tool results, steering, or a follow-up already cause that request, they satisfy the decision and no additional request is made; otherwise the loop makes one context-only request. Error and aborted responses remain hard exits, so their decisions are ignored. `finishTurn` runs again after the next request, so returning `{ action: "continue" }` unconditionally creates an endless loop.
+
+To migrate from the removed `shouldStopAfterTurn`, return `{ action: "end" }`. Guard error and aborted responses to preserve the old hook's normal-response-only invocation, especially when the predicate has side effects or assumes a successful response:
+
+```typescript
+finishTurn: async (turn, signal) => {
+  if (turn.message.stopReason === "error" || turn.message.stopReason === "aborted") return;
+  return (await shouldStop(turn, signal)) ? { action: "end" } : undefined;
+},
+```
+
+Each provider turn follows this lifecycle:
+
+```text
+selected input events
+→ prepareRequest
+→ provider response
+→ tool results
+→ finishTurn
+→ turn_end
+→ existing continuation scheduling or agent_end
+```
+
+### continue() and queued input
+
+`continue()` retains its existing queue behavior. Empty and system-only transcripts reject without consuming queues. A non-assistant tail continues from existing context: steering is polled at startup, while follow-up input waits until the response naturally stops.
+
+```typescript
+agent.followUp({ role: "user", content: "After the retry", timestamp: Date.now() });
+await agent.continue(); // The first request retries the existing user/toolResult tail.
+```
+
+An assistant tail cannot be sent directly, so `continue()` falls back to one queued steering batch, then one queued follow-up batch. Queue mode still controls whether that selected batch contains one message or all messages:
+
+```typescript
+agent.steer({ role: "user", content: "Continue from here", timestamp: Date.now() });
+await agent.continue(); // Uses the queued message only because the tail is assistant.
+```
 
 ### Event Types
 
 | Event | Description |
 |-------|-------------|
 | `agent_start` | Agent begins processing |
-| `agent_end` | Agent completes with all new messages |
+| `agent_end` | Final event for the run. Awaited subscribers for this event still count toward settlement |
 | `turn_start` | New turn begins (one LLM call + tool executions) |
 | `turn_end` | Turn completes with assistant message and tool results |
 | `message_start` | Any message begins (user, assistant, toolResult) |
@@ -134,15 +197,18 @@ The last message in context must be `user` or `toolResult` (not `assistant`).
 | `tool_execution_update` | Tool streams progress |
 | `tool_execution_end` | Tool completes |
 
+`Agent.subscribe()` listeners are awaited in registration order. `agent_end` means no more loop events will be emitted, but `await agent.waitForIdle()` and `await agent.prompt(...)` only settle after awaited `agent_end` listeners finish.
+
 ## Agent Options
 
 ```typescript
 const agent = new Agent({
-  // Initial state
+  // Initial state. systemPrompt and tools become the leading system message
+  // unless messages already starts with one.
   initialState: {
     systemPrompt: string,
     model: Model<any>,
-    thinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh",
+    thinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max",
     tools: AgentTool<any>[],
     messages: AgentMessage[],
   },
@@ -159,11 +225,17 @@ const agent = new Agent({
   // Follow-up mode: "one-at-a-time" (default) or "all"
   followUpMode: "one-at-a-time",
 
-  // Custom stream function (for proxy backends)
-  streamFn: streamProxy,
+  // Required stream function. Receives a TranscriptContext: the prompt and tools
+  // are in the transcript's system messages, not on the context.
+  streamFn: models.streamSimple.bind(models),
 
   // Session ID for provider caching
   sessionId: "session-123",
+
+  // How requests identify the app to providers (pi-ai ClientIdentity), merged over
+  // DEFAULT_AGENT_IDENTITY ({ attribution: PI_ATTRIBUTION }: provider attribution headers name pi).
+  // Pass your app's attribution, or null to send none.
+  identity: { attribution: { name: "my-app", url: "https://my-app.example" } },
 
   // Dynamic API key resolution (for expiring OAuth tokens)
   getApiKey: async (provider) => refreshToken(),
@@ -174,15 +246,30 @@ const agent = new Agent({
   // Preflight each tool call after args are validated. Can block execution.
   beforeToolCall: async ({ toolCall, args, context }) => {
     if (toolCall.name === "bash") {
-      return { block: true, reason: "bash is disabled" };
+      return { block: true, reason: "bash is disabled", terminate: true };
     }
   },
 
   // Postprocess each tool result before final tool events are emitted.
   afterToolCall: async ({ toolCall, result, isError, context }) => {
+    if (toolCall.name === "notify_done" && !isError) {
+      return { terminate: true };
+    }
     if (!isError) {
       return { details: { ...result.details, audited: true } };
     }
+  },
+
+  // Rebuild finalized context immediately before every provider request.
+  prepareRequest: async ({ context }, signal) => {
+    return { context: { ...context, messages: await loadCanonicalMessages(signal) } };
+  },
+
+  // Finalize a completed turn before turn_end is emitted.
+  // `continue` ensures one next request; existing tool/queue scheduling can satisfy it.
+  // `end` ends this run after turn_end without polling queues.
+  finishTurn: async ({ message, toolResults }, signal) => {
+    return shouldContinue(message, toolResults) ? { action: "continue" } : undefined;
   },
 
   // Custom thinking budgets for token-based providers
@@ -199,19 +286,35 @@ const agent = new Agent({
 
 ```typescript
 interface AgentState {
-  systemPrompt: string;
   model: Model<any>;
   thinkingLevel: ThinkingLevel;
   tools: AgentTool<any>[];
   messages: AgentMessage[];
-  isStreaming: boolean;
-  streamMessage: AgentMessage | null;  // Current partial during streaming
-  pendingToolCalls: Set<string>;
-  error?: string;
+  readonly isStreaming: boolean;
+  readonly streamingMessage?: AgentMessage;
+  readonly pendingToolCalls: ReadonlySet<string>;
+  readonly errorMessage?: string;
 }
 ```
 
-Access via `agent.state`. During streaming, `streamMessage` contains the partial assistant message.
+Access state via `agent.state`.
+
+Assigning `agent.state.tools = [...]` or `agent.state.messages = [...]` copies the top-level array before storing it. Mutating the returned array mutates the current agent state.
+
+The transcript owns the system prompt and tool declarations: the leading system message is the prompt, later system messages patch it (see `SystemMessage` in pi-ai). `agent.state.systemPrompt` is read-only and replays the transcript. `agent.state.tools` is the executable loadout; before every request the loop diffs it against the tools the transcript declares and, if they differ, announces the change in a system message (merged into a pending system message when one exists). pi-ai's `getCurrentSystemMessage(messages)` returns the replayed head, including declared tools, for any message array, including agent transcripts with custom message roles.
+
+To change the prompt mid-conversation, append a system message with `content` (added instructions) or `sections` (named replacements):
+
+```typescript
+await agent.prompt([
+  { role: "system", content: "", sections: { skills: "<skills>...</skills>" }, timestamp: Date.now() },
+  { role: "user", content: "Continue", timestamp: Date.now() },
+]);
+```
+
+During streaming, `agent.state.streamingMessage` contains the current partial assistant message.
+
+`agent.state.isStreaming` remains `true` until the run fully settles, including awaited `agent_end` subscribers.
 
 ## Methods
 
@@ -229,24 +332,27 @@ await agent.prompt("What's in this image?", [
 // AgentMessage directly
 await agent.prompt({ role: "user", content: "Hello", timestamp: Date.now() });
 
-// Continue from current context (last message must be user or toolResult)
+// Continue existing non-assistant input; an assistant tail may use queued input as fallback
 await agent.continue();
 ```
 
 ### State Management
 
 ```typescript
-agent.setSystemPrompt("New prompt");
-agent.setModel(getModel("openai", "gpt-4o"));
-agent.setThinkingLevel("medium");
-agent.setTools([myTool]);
-agent.setToolExecution("sequential");
-agent.setBeforeToolCall(async ({ toolCall }) => undefined);
-agent.setAfterToolCall(async ({ toolCall, result }) => undefined);
-agent.replaceMessages(newMessages);
-agent.appendMessage(message);
-agent.clearMessages();
-agent.reset();  // Clear everything
+agent.state.model = getModel("openai", "gpt-4o");
+agent.state.thinkingLevel = "medium";
+agent.state.tools = [myTool];
+agent.toolExecution = "sequential";
+agent.beforeToolCall = async ({ toolCall }) => undefined;
+agent.afterToolCall = async ({ toolCall, result }) => undefined;
+agent.prepareRequest = async ({ context }) => ({
+  context: { ...context, messages: await loadCanonicalMessages() },
+});
+agent.finishTurn = async () => undefined;
+agent.state.messages = newMessages; // top-level array is copied
+agent.state.messages.push(message);
+const nextQueuedMessages = agent.peekQueuedMessages(); // respects queue modes; does not consume
+agent.reset();
 ```
 
 ### Session and Thinking Budgets
@@ -272,8 +378,11 @@ await agent.waitForIdle(); // Wait for completion
 ### Events
 
 ```typescript
-const unsubscribe = agent.subscribe((event) => {
-  console.log(event.type);
+const unsubscribe = agent.subscribe(async (event, signal) => {
+  if (event.type === "agent_end") {
+    // Final barrier work for the run
+    await flushSessionState(signal);
+  }
 });
 unsubscribe();
 ```
@@ -283,8 +392,8 @@ unsubscribe();
 Steering messages let you interrupt the agent while tools are running. Follow-up messages let you queue work after the agent would otherwise stop.
 
 ```typescript
-agent.setSteeringMode("one-at-a-time");
-agent.setFollowUpMode("one-at-a-time");
+agent.steeringMode = "one-at-a-time";
+agent.followUpMode = "one-at-a-time";
 
 // While agent is running tools
 agent.steer({
@@ -300,8 +409,8 @@ agent.followUp({
   timestamp: Date.now(),
 });
 
-const steeringMode = agent.getSteeringMode();
-const followUpMode = agent.getFollowUpMode();
+const steeringMode = agent.steeringMode;
+const followUpMode = agent.followUpMode;
 
 agent.clearSteeringQueue();
 agent.clearFollowUpQueue();
@@ -310,10 +419,10 @@ agent.clearAllQueues();
 
 Use clearSteeringQueue, clearFollowUpQueue, or clearAllQueues to drop queued messages.
 
-When steering messages are detected after a tool completes:
-1. Remaining tools are skipped with error results
+When steering messages are detected after a turn completes:
+1. All tool calls from the current assistant message have already finished
 2. Steering messages are injected
-3. LLM responds to the interruption
+3. The LLM responds on the next turn
 
 Follow-up messages are checked only when there are no more tool calls and no steering messages. If any are queued, they are injected and another turn runs.
 
@@ -322,7 +431,7 @@ Follow-up messages are checked only when there are no more tool calls and no ste
 Extend `AgentMessage` via declaration merging:
 
 ```typescript
-declare module "@mariozechner/pi-agent-core" {
+declare module "@earendil-works/pi-agent-core" {
   interface CustomAgentMessages {
     notification: { role: "notification"; text: string; timestamp: number };
   }
@@ -336,6 +445,7 @@ Handle custom types in `convertToLlm`:
 
 ```typescript
 const agent = new Agent({
+  streamFn: models.streamSimple.bind(models),
   convertToLlm: (messages) => messages.flatMap(m => {
     if (m.role === "notification") return []; // Filter out
     return [m];
@@ -345,24 +455,33 @@ const agent = new Agent({
 
 ## Tools
 
-Define tools using `AgentTool`:
+Define tools using `AgentTool`. `parameters` is any JSON Schema object; built with `@earendil-works/pi-schema`'s builders, it also types `params` (other schemas give `unknown`, `AgentTool<any>` gives `any`):
 
 ```typescript
-import { Type } from "@sinclair/typebox";
+import { obj, str } from "@earendil-works/pi-schema";
 
-const readFileTool: AgentTool = {
+const readFileParameters = obj({
+  path: str({ description: "File path" }),
+});
+
+const readFileTool: AgentTool<typeof readFileParameters> = {
   name: "read_file",
   label: "Read File",  // For UI display
   description: "Read a file's contents",
-  parameters: Type.Object({
-    path: Type.String({ description: "File path" }),
-  }),
+  parameters: readFileParameters,
+  // Override execution mode for this tool (optional).
+  // "sequential" forces the entire batch to run one at a time.
+  // "parallel" allows concurrent execution with other tool calls.
+  // If omitted, the global toolExecution config applies.
+  executionMode: "sequential",
   execute: async (toolCallId, params, signal, onUpdate) => {
     const content = await fs.readFile(params.path, "utf-8");
 
     // Optional: stream progress
     onUpdate?.({ content: [{ type: "text", text: "Reading..." }], details: {} });
 
+    // Optional: add `terminate: true` here to skip the automatic follow-up LLM call
+    // when every finalized tool result in the batch does the same.
     return {
       content: [{ type: "text", text: content }],
       details: { path: params.path, size: content.length },
@@ -370,7 +489,7 @@ const readFileTool: AgentTool = {
   },
 };
 
-agent.setTools([readFileTool]);
+agent.state.tools = [readFileTool];
 ```
 
 ### Error Handling
@@ -389,12 +508,18 @@ execute: async (toolCallId, params, signal, onUpdate) => {
 
 Thrown errors are caught by the agent and reported to the LLM as tool errors with `isError: true`.
 
+Return `terminate: true` from `execute()`, a blocked `beforeToolCall`, or `afterToolCall` to hint that the agent should stop after the current tool batch. This only takes effect when every finalized tool result in the batch is terminating. The hint is runtime-only; emitted `toolResult` transcript messages remain standard LLM tool results.
+
+### MCP and Codemode
+
+`@earendil-works/pi-mcp` connects to MCP servers and `@earendil-works/pi-codemode` runs model-written JavaScript that calls tools. [examples/mcp-codemode](examples/mcp-codemode) wraps both as `AgentTool`s: one tool per MCP tool, and a `codemode` tool whose scripts call the agent's tools through `runToolCall()`, so `beforeToolCall` and `afterToolCall` apply to those calls too.
+
 ## Proxy Usage
 
 For browser apps that proxy through a backend:
 
 ```typescript
-import { Agent, streamProxy } from "@mariozechner/pi-agent-core";
+import { Agent, streamProxy } from "@earendil-works/pi-agent-core";
 
 const agent = new Agent({
   streamFn: (model, context, options) =>
@@ -411,30 +536,30 @@ const agent = new Agent({
 For direct control without the Agent class:
 
 ```typescript
-import { agentLoop, agentLoopContinue } from "@mariozechner/pi-agent-core";
+import { agentLoop, agentLoopContinue } from "@earendil-works/pi-agent-core";
 
 const context: AgentContext = {
-  systemPrompt: "You are helpful.",
-  messages: [],
+  messages: [{ role: "system", content: "You are helpful.", timestamp: Date.now() }],
   tools: [],
 };
 
 const config: AgentLoopConfig = {
   model: getModel("openai", "gpt-4o"),
   convertToLlm: (msgs) => msgs.filter(m => ["user", "assistant", "toolResult"].includes(m.role)),
-  toolExecution: "parallel",
+  toolExecution: "parallel",  // overridden by per-tool executionMode if set
   beforeToolCall: async ({ toolCall, args, context }) => undefined,
   afterToolCall: async ({ toolCall, result, isError, context }) => undefined,
 };
 
 const userMessage = { role: "user", content: "Hello", timestamp: Date.now() };
 
-for await (const event of agentLoop([userMessage], context, config)) {
+const streamFn = models.streamSimple.bind(models);
+for await (const event of agentLoop([userMessage], context, config, undefined, streamFn)) {
   console.log(event.type);
 }
 
 // Continue from existing context
-for await (const event of agentLoopContinue(context, config)) {
+for await (const event of agentLoopContinue(context, config, undefined, streamFn)) {
   console.log(event.type);
 }
 ```

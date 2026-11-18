@@ -1,7 +1,9 @@
-import { beforeAll, describe, expect, it, vi } from "vitest";
-import type { SessionInfo } from "../src/core/session-manager.js";
-import { SessionSelectorComponent } from "../src/modes/interactive/components/session-selector.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { setKeybindings } from "@earendil-works/pi-tui";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { KeybindingsManager } from "../src/core/keybindings.ts";
+import type { SessionInfo } from "../src/core/session-manager.ts";
+import { SessionSelectorComponent } from "../src/modes/interactive/components/session-selector.ts";
+import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
 async function flushPromises(): Promise<void> {
 	await new Promise<void>((resolve) => {
@@ -31,8 +33,14 @@ describe("session selector rename", () => {
 		initTheme("dark");
 	});
 
+	beforeEach(() => {
+		// Ensure test isolation: keybindings are a global singleton
+		setKeybindings(new KeybindingsManager());
+	});
+
 	it("shows rename hint in interactive /resume picker configuration", async () => {
 		const sessions = [makeSession({ id: "a" })];
+		const keybindings = new KeybindingsManager();
 		const selector = new SessionSelectorComponent(
 			async () => sessions,
 			async () => [],
@@ -40,7 +48,7 @@ describe("session selector rename", () => {
 			() => {},
 			() => {},
 			() => {},
-			{ showRenameHint: true },
+			{ showRenameHint: true, keybindings },
 		);
 		await flushPromises();
 
@@ -51,6 +59,7 @@ describe("session selector rename", () => {
 
 	it("does not show rename hint in --resume picker configuration", async () => {
 		const sessions = [makeSession({ id: "a" })];
+		const keybindings = new KeybindingsManager();
 		const selector = new SessionSelectorComponent(
 			async () => sessions,
 			async () => [],
@@ -58,7 +67,7 @@ describe("session selector rename", () => {
 			() => {},
 			() => {},
 			() => {},
-			{ showRenameHint: false },
+			{ showRenameHint: false, keybindings },
 		);
 		await flushPromises();
 
@@ -71,6 +80,7 @@ describe("session selector rename", () => {
 		const sessions = [makeSession({ id: "a", name: "Old" })];
 		const renameSession = vi.fn(async () => {});
 
+		const keybindings = new KeybindingsManager();
 		const selector = new SessionSelectorComponent(
 			async () => sessions,
 			async () => [],
@@ -78,7 +88,7 @@ describe("session selector rename", () => {
 			() => {},
 			() => {},
 			() => {},
-			{ renameSession, showRenameHint: true },
+			{ renameSession, showRenameHint: true, keybindings },
 		);
 		await flushPromises();
 
@@ -97,5 +107,38 @@ describe("session selector rename", () => {
 
 		expect(renameSession).toHaveBeenCalledTimes(1);
 		expect(renameSession).toHaveBeenCalledWith(sessions[0]!.path, "XOld");
+	});
+
+	it("keeps the renamed session selected when the reload starts with another session", async () => {
+		const sessions = [1, 2, 3, 4, 5].map((i) => makeSession({ id: `s${i}`, modified: new Date(10_000 - i * 1000) }));
+		let loads = 0;
+		const keybindings = new KeybindingsManager();
+		const selector = new SessionSelectorComponent(
+			async (onProgress) => {
+				// On reload, the first partial list holds only the file that finished loading first
+				if (loads++ > 0) onProgress?.(1, sessions.length, [sessions[4]!]);
+				return sessions;
+			},
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ renameSession: async () => {}, showRenameHint: true, keybindings },
+		);
+		await flushPromises();
+
+		const list = selector.getSessionList();
+		list.handleInput("\x1b[B");
+		list.handleInput("\x1b[B");
+		expect(list.getSelectedSessionPath()).toBe(sessions[2]!.path);
+
+		list.handleInput(CTRL_R);
+		selector.handleInput("X");
+		selector.handleInput("\r");
+		await flushPromises();
+
+		expect(loads).toBe(2);
+		expect(selector.getSessionList().getSelectedSessionPath()).toBe(sessions[2]!.path);
 	});
 });

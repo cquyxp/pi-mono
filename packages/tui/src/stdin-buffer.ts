@@ -20,8 +20,17 @@
 import { EventEmitter } from "events";
 
 const ESC = "\x1b";
+const DEFAULT_SEQUENCE_TIMEOUT_MS = 50;
+const DEFAULT_ESCAPE_TIMEOUT_MS = 10;
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
+// Color and program-status OSC replies, XTVersion, and Kitty graphics replies.
+// Until their header is complete, the input may be batched legacy Alt keystrokes.
+const TERMINAL_REPLY_HEADER_PATTERN = /^\x1b(?:\](?:1[01];|4;\d{1,3};|7501;\?)|P>\||_G(?:[a-z]=\d+,)*[a-z]=\d+;)/;
+
+function isControlString(data: string): boolean {
+	return data.startsWith(`${ESC}]`) || data.startsWith(`${ESC}P`) || data.startsWith(`${ESC}_`);
+}
 
 /**
  * Check if a string is a complete escape sequence or needs more data
@@ -181,6 +190,14 @@ function isCompleteApcSequence(data: string): "complete" | "incomplete" {
 /**
  * Split accumulated buffer into complete sequences
  */
+function parseUnmodifiedKittyPrintableCodepoint(sequence: string): number | undefined {
+	const match = sequence.match(/^\x1b\[(\d+)(?::\d*)?(?::\d+)?u$/);
+	if (!match) return undefined;
+
+	const codepoint = parseInt(match[1]!, 10);
+	return codepoint >= 32 ? codepoint : undefined;
+}
+
 function extractCompleteSequences(buffer: string): { sequences: string[]; remainder: string } {
 	const sequences: string[] = [];
 	let pos = 0;
@@ -190,13 +207,51 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 
 		// Try to extract a sequence starting at this position
 		if (remaining.startsWith(ESC)) {
+			const terminalReply = isControlString(remaining) && TERMINAL_REPLY_HEADER_PATTERN.test(remaining);
 			// Find the end of this escape sequence
 			let seqEnd = 1;
 			while (seqEnd <= remaining.length) {
+				if (terminalReply && seqEnd > 2) {
+					const char = remaining[seqEnd - 1];
+					if (char === "\x18" || char === "\x1a") {
+						// CAN and SUB cancel the string, not subsequent keyboard input.
+						pos += seqEnd;
+						break;
+					}
+					if (char === ESC && seqEnd < remaining.length && remaining[seqEnd] !== "\\") {
+						// A new escape sequence aborts an unterminated reply. Keep a
+						// trailing ESC buffered until we can distinguish it from ST.
+						pos += seqEnd - 1;
+						break;
+					}
+				}
 				const candidate = remaining.slice(0, seqEnd);
 				const status = isCompleteSequence(candidate);
 
 				if (status === "complete") {
+					// WezTerm with enable_kitty_keyboard sends the Escape key press as a
+					// raw '\x1b' byte (simple text path in encode_kitty, ignoring
+					// DISAMBIGUATE_ESCAPE_CODES) and the release as a full Kitty CSI-u
+					// sequence. These arrive concatenated as '\x1b\x1b[27;...u'.
+					// The buffer would normally treat '\x1b\x1b' as a complete meta-key
+					// sequence (ESC + single char), leaving '[27;...u' to be typed as
+					// plain text. If the character immediately following '\x1b\x1b'
+					// would begin a new escape sequence, emit only the first ESC and
+					// restart from the second.
+					if (candidate === "\x1b\x1b") {
+						const nextChar = remaining[seqEnd];
+						if (
+							nextChar === "[" || // CSI
+							nextChar === "]" || // OSC
+							nextChar === "O" || // SS3
+							nextChar === "P" || // DCS
+							nextChar === "_" // APC
+						) {
+							sequences.push(ESC);
+							pos += 1;
+							break;
+						}
+					}
 					sequences.push(candidate);
 					pos += seqEnd;
 					break;
@@ -225,10 +280,17 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 
 export type StdinBufferOptions = {
 	/**
-	 * Maximum time to wait for sequence completion (default: 10ms)
-	 * After this time, the buffer is flushed even if incomplete
+	 * Maximum time to wait for an incomplete keyboard or mouse sequence
+	 * (default: 50ms). Strings with a recognized terminal reply header wait for
+	 * their terminator instead, so delayed replies cannot become keypresses.
+	 * Ambiguous legacy Alt-key input still uses this timeout.
 	 */
 	timeout?: number;
+	/**
+	 * Maximum time to wait after a lone ESC before treating it as Escape
+	 * (default: 10ms). Increase for high-latency Alt+key input (SSH).
+	 */
+	escapeTimeout?: number;
 };
 
 export type StdinBufferEventMap = {
@@ -244,12 +306,15 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	private buffer: string = "";
 	private timeout: ReturnType<typeof setTimeout> | null = null;
 	private readonly timeoutMs: number;
+	private readonly escapeTimeoutMs: number;
 	private pasteMode: boolean = false;
 	private pasteBuffer: string = "";
+	private pendingKittyPrintableCodepoint: number | undefined;
 
 	constructor(options: StdinBufferOptions = {}) {
 		super();
-		this.timeoutMs = options.timeout ?? 10;
+		this.timeoutMs = options.timeout ?? DEFAULT_SEQUENCE_TIMEOUT_MS;
+		this.escapeTimeoutMs = options.escapeTimeout ?? DEFAULT_ESCAPE_TIMEOUT_MS;
 	}
 
 	public process(data: string | Buffer): void {
@@ -274,7 +339,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 
 		if (str.length === 0 && this.buffer.length === 0) {
-			this.emit("data", "");
+			this.emitDataSequence("");
 			return;
 		}
 
@@ -291,6 +356,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 
 				this.pasteMode = false;
 				this.pasteBuffer = "";
+				this.pendingKittyPrintableCodepoint = undefined;
 
 				this.emit("paste", pastedContent);
 
@@ -307,10 +373,11 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				const beforePaste = this.buffer.slice(0, startIndex);
 				const result = extractCompleteSequences(beforePaste);
 				for (const sequence of result.sequences) {
-					this.emit("data", sequence);
+					this.emitDataSequence(sequence);
 				}
 			}
 
+			this.pendingKittyPrintableCodepoint = undefined;
 			this.buffer = this.buffer.slice(startIndex + BRACKETED_PASTE_START.length);
 			this.pasteMode = true;
 			this.pasteBuffer = this.buffer;
@@ -323,6 +390,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 
 				this.pasteMode = false;
 				this.pasteBuffer = "";
+				this.pendingKittyPrintableCodepoint = undefined;
 
 				this.emit("paste", pastedContent);
 
@@ -337,18 +405,42 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.buffer = result.remainder;
 
 		for (const sequence of result.sequences) {
-			this.emit("data", sequence);
+			this.emitDataSequence(sequence);
 		}
 
 		if (this.buffer.length > 0) {
+			// Only a recognizable reply header establishes a delimited string.
+			// Flushing it would turn a delayed tail into text and an OSC's BEL
+			// terminator into Ctrl+G (the external editor shortcut). Other input,
+			// including Alt+] followed by text, must retain bounded recovery.
+			if (TERMINAL_REPLY_HEADER_PATTERN.test(this.buffer)) return;
+			const timeoutMs = this.buffer === ESC ? this.escapeTimeoutMs : this.timeoutMs;
 			this.timeout = setTimeout(() => {
 				const flushed = this.flush();
 
 				for (const sequence of flushed) {
-					this.emit("data", sequence);
+					if (sequence.length > 2 && isControlString(sequence)) {
+						// Recover the Alt key and reparse its tail so batched text,
+						// Enter, and control keys are not swallowed as one event.
+						this.emitDataSequence(sequence.slice(0, 2));
+						this.process(sequence.slice(2));
+					} else {
+						this.emitDataSequence(sequence);
+					}
 				}
-			}, this.timeoutMs);
+			}, timeoutMs);
 		}
+	}
+
+	private emitDataSequence(sequence: string): void {
+		const rawCodepoint = sequence.length === 1 ? sequence.codePointAt(0) : undefined;
+		if (rawCodepoint !== undefined && rawCodepoint === this.pendingKittyPrintableCodepoint) {
+			this.pendingKittyPrintableCodepoint = undefined;
+			return;
+		}
+
+		this.pendingKittyPrintableCodepoint = parseUnmodifiedKittyPrintableCodepoint(sequence);
+		this.emit("data", sequence);
 	}
 
 	flush(): string[] {
@@ -363,6 +455,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 
 		const sequences = [this.buffer];
 		this.buffer = "";
+		this.pendingKittyPrintableCodepoint = undefined;
 		return sequences;
 	}
 
@@ -374,6 +467,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.buffer = "";
 		this.pasteMode = false;
 		this.pasteBuffer = "";
+		this.pendingKittyPrintableCodepoint = undefined;
 	}
 
 	getBuffer(): string {

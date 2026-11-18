@@ -12,10 +12,12 @@
  *
  * How it works:
  * - registerTool() with the same name as a built-in replaces it entirely
- * - We create instances of the original tools via createReadTool(), etc.
- *   and delegate execute() to them
+ * - We create the original definitions via createReadToolDefinition(), etc.
+ *   and override only their renderers
  * - renderCall() controls what's shown when the tool is invoked
  * - renderResult() controls what's shown after execution completes
+ * - renderShell: "self" lets a tool render its own outer shell instead of
+ *   using the default boxed shell from ToolExecutionComponent
  * - The `expanded` flag in renderResult indicates whether the user has
  *   toggled the tool output open (via ctrl+e or clicking)
  *
@@ -23,26 +25,24 @@
  *   pi -e ./built-in-tool-renderer.ts
  */
 
-import type { BashToolDetails, EditToolDetails, ExtensionAPI, ReadToolDetails } from "@mariozechner/pi-coding-agent";
-import { createBashTool, createEditTool, createReadTool, createWriteTool } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import type { BashToolDetails, EditToolDetails, ExtensionAPI, ReadToolDetails } from "@earendil-works/pi-coding-agent";
+import {
+	createBashToolDefinition,
+	createEditToolDefinition,
+	createReadToolDefinition,
+	createWriteToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 
 export default function (pi: ExtensionAPI) {
 	const cwd = process.cwd();
 
 	// --- Read tool: show path and line count ---
-	const originalRead = createReadTool(cwd);
+	const originalRead = createReadToolDefinition(cwd);
 	pi.registerTool({
-		name: "read",
-		label: "read",
-		description: originalRead.description,
-		parameters: originalRead.parameters,
+		...originalRead,
 
-		async execute(toolCallId, params, signal, onUpdate) {
-			return originalRead.execute(toolCallId, params, signal, onUpdate);
-		},
-
-		renderCall(args, theme) {
+		renderCall(args, theme, _context) {
 			let text = theme.fg("toolTitle", theme.bold("read "));
 			text += theme.fg("accent", args.path);
 			if (args.offset || args.limit) {
@@ -54,7 +54,7 @@ export default function (pi: ExtensionAPI) {
 			return new Text(text, 0, 0);
 		},
 
-		renderResult(result, { expanded, isPartial }, theme) {
+		renderResult(result, { expanded, isPartial }, theme, _context) {
 			if (isPartial) return new Text(theme.fg("warning", "Reading..."), 0, 0);
 
 			const details = result.details as ReadToolDetails | undefined;
@@ -90,18 +90,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// --- Bash tool: show command and exit code ---
-	const originalBash = createBashTool(cwd);
+	const originalBash = createBashToolDefinition(cwd);
 	pi.registerTool({
-		name: "bash",
-		label: "bash",
-		description: originalBash.description,
-		parameters: originalBash.parameters,
+		...originalBash,
 
-		async execute(toolCallId, params, signal, onUpdate) {
-			return originalBash.execute(toolCallId, params, signal, onUpdate);
-		},
-
-		renderCall(args, theme) {
+		renderCall(args, theme, _context) {
 			let text = theme.fg("toolTitle", theme.bold("$ "));
 			const cmd = args.command.length > 80 ? `${args.command.slice(0, 77)}...` : args.command;
 			text += theme.fg("accent", cmd);
@@ -111,7 +104,7 @@ export default function (pi: ExtensionAPI) {
 			return new Text(text, 0, 0);
 		},
 
-		renderResult(result, { expanded, isPartial }, theme) {
+		renderResult(result, { expanded, isPartial }, theme, _context) {
 			if (isPartial) return new Text(theme.fg("warning", "Running..."), 0, 0);
 
 			const details = result.details as BashToolDetails | undefined;
@@ -149,24 +142,17 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// --- Edit tool: show path and diff stats ---
-	const originalEdit = createEditTool(cwd);
+	const originalEdit = createEditToolDefinition(cwd);
 	pi.registerTool({
-		name: "edit",
-		label: "edit",
-		description: originalEdit.description,
-		parameters: originalEdit.parameters,
+		...originalEdit,
 
-		async execute(toolCallId, params, signal, onUpdate) {
-			return originalEdit.execute(toolCallId, params, signal, onUpdate);
-		},
-
-		renderCall(args, theme) {
+		renderCall(args, theme, _context) {
 			let text = theme.fg("toolTitle", theme.bold("edit "));
 			text += theme.fg("accent", args.path);
 			return new Text(text, 0, 0);
 		},
 
-		renderResult(result, { expanded, isPartial }, theme) {
+		renderResult(result, { expanded, isPartial }, theme, _context) {
 			if (isPartial) return new Text(theme.fg("warning", "Editing..."), 0, 0);
 
 			const details = result.details as EditToolDetails | undefined;
@@ -213,18 +199,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// --- Write tool: show path and size ---
-	const originalWrite = createWriteTool(cwd);
+	const originalWrite = createWriteToolDefinition(cwd);
 	pi.registerTool({
-		name: "write",
-		label: "write",
-		description: originalWrite.description,
-		parameters: originalWrite.parameters,
+		...originalWrite,
 
-		async execute(toolCallId, params, signal, onUpdate) {
-			return originalWrite.execute(toolCallId, params, signal, onUpdate);
-		},
-
-		renderCall(args, theme) {
+		renderCall(args, theme, _context) {
 			let text = theme.fg("toolTitle", theme.bold("write "));
 			text += theme.fg("accent", args.path);
 			const lineCount = args.content.split("\n").length;
@@ -232,7 +211,7 @@ export default function (pi: ExtensionAPI) {
 			return new Text(text, 0, 0);
 		},
 
-		renderResult(result, { isPartial }, theme) {
+		renderResult(result, { isPartial }, theme, _context) {
 			if (isPartial) return new Text(theme.fg("warning", "Writing..."), 0, 0);
 
 			const content = result.content[0];

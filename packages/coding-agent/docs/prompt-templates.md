@@ -1,67 +1,59 @@
-> pi can create prompt templates. Ask it to build one for your workflow.
-
 # Prompt Templates
 
-Prompt templates are Markdown snippets that expand into full prompts. Type `/name` in the editor to invoke a template, where `name` is the filename without `.md`.
+Prompt templates turn Markdown files into reusable `/` commands. Use one when you want to reuse the same prompt without adding executable behavior or a larger set of supporting instructions.
 
-## Locations
+A template can accept arguments and appear in command completion. Pi can load templates from personal configuration, project configuration, an explicit path, or a Pi package. Project configuration loads only after project trust is granted.
 
-Pi loads prompt templates from:
+## Create a template
 
-- Global: `~/.pi/agent/prompts/*.md`
-- Project: `.pi/prompts/*.md`
-- Packages: `prompts/` directories or `pi.prompts` entries in `package.json`
-- Settings: `prompts` array with files or directories
-- CLI: `--prompt-template <path>` (repeatable)
-
-Disable discovery with `--no-prompt-templates`.
-
-## Format
+Create `~/.pi/agent/prompts/review.md`:
 
 ```markdown
 ---
 description: Review staged git changes
+argument-hint: "[focus]"
 ---
-Review the staged changes (`git diff --cached`). Focus on:
-- Bugs and logic errors
-- Security issues
-- Error handling gaps
+Review the staged changes. Focus on ${1:-correctness, security, and error handling}.
 ```
 
-- The filename becomes the command name. `review.md` becomes `/review`.
-- `description` is optional. If missing, the first non-empty line is used.
+The filename becomes the command name, so this template is available as `/review`. The `description` appears in command completion. If it is omitted, Pi uses the first non-empty line.
 
-## Usage
+`argument-hint` is optional. Use `<angle brackets>` for required arguments and `[square brackets]` for optional arguments.
 
-Type `/` followed by the template name in the editor. Autocomplete shows available templates with descriptions.
+Run `/reload` after adding or changing a template in an active session.
 
-```
-/review                           # Expands review.md
-/component Button                 # Expands with argument
-/component Button "click handler" # Multiple arguments
-```
+<a id="invoke-a-template"></a>
 
-## Arguments
+## Use a template
 
-Templates support positional arguments and simple slicing:
+Type the template command in the editor:
 
-- `$1`, `$2`, ... positional args
-- `$@` or `$ARGUMENTS` for all args joined
-- `${@:N}` for args from the Nth position (1-indexed)
-- `${@:N:L}` for `L` args starting at N
-
-Example:
-
-```markdown
----
-description: Create a component
----
-Create a React component named $1 with features: $@
+```text
+/review
+/review concurrency
 ```
 
-Usage: `/component Button "onClick handler" "disabled support"`
+Pi expands the template before the resulting text enters the agent. Extensions receive the raw input first through the `input` event unless an extension command with the same name handles it.
 
-## Loading Rules
+Templates support these substitutions:
 
-- Template discovery in `prompts/` is non-recursive.
-- If you want templates in subdirectories, add them explicitly via `prompts` settings or a package manifest.
+| Syntax | Result |
+|---|---|
+| `$1`, `$2`, … | One positional argument |
+| `$@` or `$ARGUMENTS` | All arguments joined with spaces |
+| `${1:-default}` | First argument, or a default value |
+| `${@:-default}` | All arguments, or a default value |
+| `${@:N}` | Arguments starting at position `N` |
+| `${@:N:L}` | `L` arguments starting at position `N` |
+
+Arguments follow shell-like quoting, so `/review "API compatibility"` supplies one argument containing a space. A quote only starts quoting at the beginning of an argument, so apostrophes inside words such as `doesn't` stay as text, and a quote with no closing match is kept as text. Inside a quoted argument, a backslash before the same quote character keeps it as text, so `/review "the \"fast\" path"` supplies `the "fast" path`; other backslashes are kept as typed.
+
+<a id="choose-where-it-loads"></a>
+
+## Add it to Pi
+
+Place the template in your user or project prompt directory. Conventional prompt directories load direct `.md` children only.
+
+Settings and packages can select nested Markdown files; a package manifest can narrow discovery with explicit paths and globs. See [Settings](settings.md#resources) and [Pi Packages](packages.md) for these options.
+
+Project templates become commands in the editor after trust is granted. Review their content before trusting an unfamiliar project. See [Security](security.md#understand-project-trust).
